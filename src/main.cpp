@@ -3,6 +3,10 @@
 #include <WiFiManager.h>
 #include <PubSubClient.h>
 #include <ModbusMaster.h>
+#include <NTPClient.h>
+#include <WiFiUdp.h>
+#include <SD.h>
+#include <SPI.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
@@ -11,6 +15,10 @@
 #define MAX485_DE_RE 27 // DE and RE combined on GPIO 27 for control
 #define RS485_RX 16    // RO pin on RS-485 module to GPIO 16 (RX2)
 #define RS485_TX 17    // DI pin on RS-485 module to GPIO 17 (TX2)
+
+const int chipSelect = 5;// SD card CS pin
+
+String status = "OK";
 
 ModbusMaster node;
 
@@ -21,6 +29,10 @@ void preTransmission() {
 void postTransmission() {
   digitalWrite(MAX485_DE_RE, LOW); // Enable Receive mode
 }
+
+// Time-related variables
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, "pool.ntp.org", 0, 3600000);  // Update time every hour
 
 WiFiClient espClient;   // MQTT client
 PubSubClient client(espClient);
@@ -47,47 +59,49 @@ StackType_t buttonStack[TASK_STACK_DEPTH];
 
 // modbus data variable
 int rs485_inquiry_taeHigh;
-  int rs485_inquiry_taeLow;
-  int rs485_inquiry_activePower;
-  int rs485_inquiry_pAvolt;
-  int rs485_inquiry_pBvolt;
-  int rs485_inquiry_pCvolt;
-  int rs485_inquiry_pABvolt;
-  int rs485_inquiry_lBCvolt;
-  int rs485_inquiry_lCAvolt;
-  int rs485_inquiry_pAcurrent;
-  int rs485_inquiry_pBcurrent;
-  int rs485_inquiry_pCcurrent;
-  int rs485_inquiry_frequency;
-  int rs485_inquiry_powerfactor;
+int rs485_inquiry_taeLow;
+int rs485_inquiry_activePower;
+int rs485_inquiry_pAvolt;
+int rs485_inquiry_pBvolt;
+int rs485_inquiry_pCvolt;
+int rs485_inquiry_lABvolt;
+int rs485_inquiry_lBCvolt;
+int rs485_inquiry_lCAvolt;
+int rs485_inquiry_pAcurrent;
+int rs485_inquiry_pBcurrent;
+int rs485_inquiry_pCcurrent;
+int rs485_inquiry_frequency;
+int rs485_inquiry_powerfactor;
 
-  float actual_taeHigh;
-  float actual_teaLow;
-  float actual_activePower;
-  float actual_pAvolt;
-  float actual_pBvolt;
-  float actual_pCvolt;
-  float actual_pABvolt;
-  float actual_lBCvolt;
-  float actual_lCAvolt;
-  float actual_pAcurrent;
-  float actual_pBcurrent;
-  float actual_pCcurrent;
-  float actual_frequency;
-  float actual_powerfactor;
+float actual_taeHigh;
+float actual_taeLow;
+float actual_activePower;
+float actual_pAvolt;
+float actual_pBvolt;
+float actual_pCvolt;
+float actual_lABvolt;
+float actual_lBCvolt;
+float actual_lCAvolt;
+float actual_pAcurrent;
+float actual_pBcurrent;
+float actual_pCcurrent;
+float actual_frequency;
+float actual_powerfactor;
 
 
 
 // Forward declarations of task functions
 void modbusReadTask(void *parameter);
 void wifi_mqtt_Task(void *parameter);
-void outputControlTask(void *parameter);
 void sdTask(void *parameter);
-void wificonfigure_Task(void *parameter);
+void buttonPressTask(void *parameter);
 
 void callback(char* topic, byte* payload, unsigned int length);
 int readModbusData(uint16_t reg_address);
 void connectToMQTT();
+String getFormattedTime();
+String getFormattedDate();
+void enableWiFiConfigurationMode();
 
 
 
@@ -111,6 +125,28 @@ void setup() {
     // Set MQTT server and callback
     client.setServer(mqtt_broker, mqtt_port);
     client.setCallback(callback);
+
+  // Initialize time client and attempt to get the time
+    timeClient.begin();
+    if (timeClient.forceUpdate()) {
+        Serial.println("Time synchronized with NTP server.");
+    } else {
+        Serial.println("Failed to sync time with NTP server. Using internal RTC if available.");
+    }
+
+    // Initialize SD card
+    if (!SD.begin(chipSelect)) {
+        Serial.println("SD card initialization failed!");
+        return;
+    }
+    Serial.println("SD card initialized.");
+
+    // Open or create file and add header if it doesn't exist
+    File file = SD.open("/em_data.csv", FILE_APPEND);
+    if (file.size() == 0) {
+        file.println("Date,Time,Status, taeHigh, taeLow, activePower, pAvolt, pBvolt, pCvolt, lABvolt, lBCvolt, lCAvolt, pAcurrent, pBcurrent, pCcurrent, frequency, powerfactor;"); // Header row
+    }
+    file.close();
 
     // Create the Modbus read task pinned to core 0
     xTaskCreateStaticPinnedToCore(
@@ -180,7 +216,7 @@ void modbusReadTask(void *parameter) {
         rs485_inquiry_pAvolt = readModbusData(0x14);
         rs485_inquiry_pBvolt = readModbusData(0x15);
         rs485_inquiry_pCvolt = readModbusData(0x16);
-        rs485_inquiry_pABvolt = readModbusData(0x17);
+        rs485_inquiry_lABvolt = readModbusData(0x17);
         rs485_inquiry_lBCvolt = readModbusData(0x18);
         rs485_inquiry_lCAvolt = readModbusData(0x19);
         rs485_inquiry_pAcurrent = readModbusData(0x10);
@@ -190,12 +226,12 @@ void modbusReadTask(void *parameter) {
         rs485_inquiry_powerfactor = readModbusData(0x1D);
 
         actual_taeHigh = rs485_inquiry_taeHigh/10.0;
-        actual_teaLow = rs485_inquiry_taeLow/10.0;
+        actual_taeLow = rs485_inquiry_taeLow/10.0;
         actual_activePower = rs485_inquiry_activePower/10.0;  
         actual_pAvolt = rs485_inquiry_pAvolt/10.0;
         actual_pBvolt = rs485_inquiry_pBvolt/10.0;  
         actual_pCvolt = rs485_inquiry_pCvolt/10.0;
-        actual_pABvolt = rs485_inquiry_pABvolt/10.0; 
+        actual_lABvolt = rs485_inquiry_lABvolt/10.0; 
         actual_lBCvolt = rs485_inquiry_lBCvolt/10.0;
         actual_lCAvolt = rs485_inquiry_lCAvolt/10.0;
         actual_pAcurrent = rs485_inquiry_pAcurrent/10.0;
@@ -219,16 +255,6 @@ int readModbusData(uint16_t reg_address) {
   } else {
     return result;
   }
-}
-
-// Output Control Task: Simulates control of an output device
-void outputControlTask(void *parameter) {
-    const TickType_t xDelay = pdMS_TO_TICKS(2000); // Delay time of 2 seconds
-
-    while (true) {
-        Serial.println("[Output Task] Controlling output device...");
-        vTaskDelay(xDelay); // Wait 2 seconds before repeating
-    }
 }
 
 
@@ -344,9 +370,63 @@ void sdTask(void *parameter) {
     const TickType_t xDelay = pdMS_TO_TICKS(2000); // Delay time of 2 seconds
 
     while (true) {
-        Serial.println("[sd Task] Controlling output device...");
+        
+        
+        // Retrieve current date and time
+        String date = getFormattedDate();
+        String time = getFormattedTime();
+
+        // Open file in append mode
+        File file = SD.open("/em_data.csv", FILE_APPEND);
+        if (file) {
+            // Write data row to file
+            file.print(date); file.print(",");
+            file.print(time); file.print(",");
+            file.print(status); file.print(",");
+            
+            // Write each variable separated by commas
+            file.print(actual_taeHigh); file.print(",");
+            file.print(actual_taeLow); file.print(",");
+            file.print(actual_activePower); file.print(",");
+            file.print(actual_pAvolt); file.print(",");
+            file.print(actual_pBvolt); file.print(",");
+            file.print(actual_pCvolt); file.print(",");
+            file.print(actual_lABvolt); file.print(",");
+            file.print(actual_lBCvolt); file.print(",");
+            file.print(actual_lCAvolt); file.print(",");
+            file.print(actual_pAcurrent); file.print(",");
+            file.print(actual_pBcurrent); file.print(",");
+            file.print(actual_pCcurrent); file.print(",");
+            file.print(actual_frequency); file.print(",");
+            file.print(actual_powerfactor); file.print(",");
+            // file.println(n);  // End of line
+
+            file.close();  // Close the file
+            Serial.println("Data written to SD card.");
+        } else {
+            Serial.println("Error opening em_data.csv.");
+        }
         vTaskDelay(xDelay); // Wait 2 seconds before repeating
     }
+}
+// Function to get the current date in "YYYY-MM-DD" format
+String getFormattedDate() {
+  if (!timeClient.isTimeSet()) return "1970-01-01";  // Default date if time not set
+  time_t rawTime = timeClient.getEpochTime();
+  struct tm * timeInfo = localtime(&rawTime);
+  char buffer[11];
+  strftime(buffer, sizeof(buffer), "%Y-%m-%d", timeInfo);
+  return String(buffer);
+}
+
+// Function to get the current time in "HH:MM:SS" format
+String getFormattedTime() {
+  if (!timeClient.isTimeSet()) return "00:00:00";  // Default time if time not set
+  time_t rawTime = timeClient.getEpochTime();
+  struct tm * timeInfo = localtime(&rawTime);
+  char buffer[9];
+  strftime(buffer, sizeof(buffer), "%H:%M:%S", timeInfo);
+  return String(buffer);
 }
 
 /**************************************************************/
