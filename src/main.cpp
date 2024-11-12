@@ -3,8 +3,10 @@
 #include <PubSubClient.h>
 #include <Preferences.h>
 
-#define MQTT_SERVER "test.mosquitto.org"
-#define MQTT_PORT 1883
+#define MQTT_SERVER "broker2.dma-bd.com"      // Replace with your secure broker's domain
+#define MQTT_PORT 1883                // Secure MQTT port (usually 8883)
+#define MQTT_USER "broker2"     // Replace with your MQTT username
+#define MQTT_PASSWORD "Secret!@#$1234"      // Replace with your MQTT password
 #define MAX_RETRIES 5
 #define BUTTON_PIN 23               // Change as per your setup
 #define SENSOR_PIN_1 39               // Change as per your setup
@@ -14,7 +16,12 @@
 // Task intervals and delays
 #define WIFI_RETRY_DELAY 30000     // Wi-Fi retry delay (30 seconds)
 #define MQTT_RETRY_DELAY 10000     // MQTT retry delay (10 seconds)
+#define WIFI_RETRY_DELAY_T 5000     // Wi-Fi retry delay (30 seconds)
+#define MQTT_RETRY_DELAY_T 30000     // MQTT retry delay (10 seconds)
 #define BACKOFF_MULTIPLIER 2       // Backoff multiplier for delay
+
+
+#define MQTT_SUBSCRIBE_TOPIC "DMA/Energy/status"
 
 // Define intervals for each sensor in milliseconds
 const unsigned long interval1 = 5000; // 5 seconds for sensor 1
@@ -33,43 +40,120 @@ WiFiManager wifiManager;
 bool debugMode = true;             // Set false to disable logging
 volatile bool apModeTriggered = false; // Flag to indicate AP mode needed
 
-void connectToWiFi() {
-    // Attempt to connect to saved Wi-Fi credentials
-    WiFi.begin();  // Uses stored credentials
 
-    // Wait for connection (could add a timeout)
+// Callback function to handle incoming messages on subscribed topics
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+    Serial.print("Message arrived on topic: ");
+    Serial.print(topic);
+    Serial.print(". Message: ");
+    String message;
+    for (unsigned int i = 0; i < length; i++) {
+        message += (char)payload[i];
+    }
+    Serial.println(message);
+
+    // Add logic to process specific messages if needed
+    if (String(topic) == MQTT_SUBSCRIBE_TOPIC) {
+        if (message == "ON") {
+            Serial.println("Turning on device...");
+            // Add logic to control hardware if needed
+        } else if (message == "OFF") {
+            Serial.println("Turning off device...");
+            // Add additional actions based on the message
+        }
+    }
+}
+
+#define WIFI_MAX_RETRIES 30
+#define MQTT_MAX_RETRIES 10
+#define MQTT_INITIAL_BACKOFF 1000  // in ms
+#define BACKOFF_MULTIPLIER_T 2
+
+// Utility macro for debugging messages
+#define DEBUG_PRINT(x) if (debugMode) Serial.print(x)
+#define DEBUG_PRINTLN(x) if (debugMode) Serial.println(x)
+
+// WiFi connection function
+void connectToWiFi() {
+    WiFi.begin();  // Attempt connection with saved credentials
     int retryCount = 0;
-    while (WiFi.status() != WL_CONNECTED && retryCount < 30) {  // 10 retries
-        vTaskDelay(500 / portTICK_PERIOD_MS);  // Wait and retry
+
+    while (WiFi.status() != WL_CONNECTED && retryCount < WIFI_MAX_RETRIES) {
+        vTaskDelay(500 / portTICK_PERIOD_MS);
         retryCount++;
-        if (debugMode) Serial.print(".");
+        DEBUG_PRINT(".");
     }
 
     if (WiFi.status() == WL_CONNECTED) {
-        if (debugMode) Serial.println("\nConnected to Wi-Fi.");
+        DEBUG_PRINTLN("\nConnected to Wi-Fi.");
     } else {
-        if (debugMode) Serial.println("\nFailed to connect to Wi-Fi. Please press the button for AP mode.");
-        // Optionally: set a flag to enable AP mode in the `button_task` on long press
+        DEBUG_PRINTLN("\nFailed to connect to Wi-Fi. Please press the button for AP mode.");
+        // Optional: Flag to enable AP mode via button press.
     }
 }
 
+// MQTT connection function with exponential backoff
 void connectToMQTT() {
     if (!mqttClient.connected()) {
-        if (debugMode) Serial.print("Connecting to MQTT...");
-        mqttClient.setServer(MQTT_SERVER, MQTT_PORT);
-        unsigned long startAttemptTime = millis();
+        int mqttRetryCount = 0;
+        int backoffDelay = MQTT_INITIAL_BACKOFF;
 
-        while (!mqttClient.connect("ESP32Client") && millis() - startAttemptTime < MQTT_RETRY_DELAY) {
-            vTaskDelay(200 / portTICK_PERIOD_MS); // Check connection status every 200ms
+        while (!mqttClient.connected() && mqttRetryCount < MQTT_MAX_RETRIES) {
+            DEBUG_PRINT("Attempting MQTT connection...");
+            
+            if (mqttClient.connect("ESP32Client", MQTT_USER, MQTT_PASSWORD)) {
+                DEBUG_PRINTLN("Connected to MQTT broker.");
+                mqttRetryCount = 0;  // Reset after successful connection
+                if (mqttClient.subscribe(MQTT_SUBSCRIBE_TOPIC)) {
+                    DEBUG_PRINTLN("Subscribed to topic.");
+                } else {
+                    DEBUG_PRINTLN("Failed to subscribe to topic.");
+                }
+            } else {
+                mqttRetryCount++;
+                int errorCode = mqttClient.state();
+                DEBUG_PRINT("Failed to connect, MQTT State Code: ");
+                DEBUG_PRINTLN(errorCode);
+
+                // Enhanced error handling
+                switch (errorCode) {
+                    case MQTT_CONNECTION_TIMEOUT:
+                        DEBUG_PRINTLN("Connection timed out.");
+                        break;
+                    case MQTT_CONNECTION_LOST:
+                        DEBUG_PRINTLN("Connection lost.");
+                        break;
+                    case MQTT_CONNECT_FAILED:
+                        DEBUG_PRINTLN("Connect failed.");
+                        break;
+                    case MQTT_DISCONNECTED:
+                        DEBUG_PRINTLN("Disconnected from broker.");
+                        break;
+                    default:
+                        DEBUG_PRINTLN("Unknown error.");
+                        break;
+                }
+
+                if (mqttRetryCount >= MQTT_MAX_RETRIES) {
+                    DEBUG_PRINTLN("Max MQTT connection retries reached. Restarting ESP...");
+                    ESP.restart();
+                } else {
+                    DEBUG_PRINT("Retrying MQTT connection in ");
+                    DEBUG_PRINT(backoffDelay);
+                    DEBUG_PRINTLN(" milliseconds...");
+                    delay(backoffDelay);
+                    backoffDelay *= BACKOFF_MULTIPLIER_T;  // Increment backoff delay
+                    if (backoffDelay > 10000) { // Cap the backoff delay
+                        backoffDelay = 10000;
+                    }
+                }
+            }
         }
     }
-
-    if (mqttClient.connected()) {
-        if (debugMode) Serial.println("Connected to MQTT.");
-    } else {
-        if (debugMode) Serial.println("MQTT connection failed.");
-    }
 }
+
+
+
 
 void wifi_mqtt_task(void *pvParameters) {
     int wifi_attempts = preferences.getInt("wifi_attempts", 0);
@@ -91,7 +175,7 @@ void wifi_mqtt_task(void *pvParameters) {
                 if (debugMode) Serial.printf("Wi-Fi attempt %d failed.\n", wifi_attempts);
                 if (wifi_attempts >= MAX_RETRIES) ESP.restart();
 
-                backoffDelay *= BACKOFF_MULTIPLIER;
+                backoffDelay *= BACKOFF_MULTIPLIER_T;
                 vTaskDelay(backoffDelay / portTICK_PERIOD_MS);
                 continue;
             }
@@ -171,7 +255,7 @@ void sensor_task(void *pvParameters) {
 
             if (WiFi.isConnected() && mqttClient.connected()) {
                 String payload = String(sensorValue1);
-                if (mqttClient.publish("sensor1/data", payload.c_str())) {
+                if (mqttClient.publish("DMA/Energy/data", payload.c_str())) {
                     Serial.println("Sensor 1 data published to MQTT.");
                 } else {
                     Serial.println("Failed to publish sensor 1 data.");
@@ -189,7 +273,7 @@ void sensor_task(void *pvParameters) {
 
             if (WiFi.isConnected() && mqttClient.connected()) {
                 String payload = String(sensorValue2);
-                if (mqttClient.publish("sensor2/data", payload.c_str())) {
+                if (mqttClient.publish("DMA/Energy/data2", payload.c_str())) {
                     Serial.println("Sensor 2 data published to MQTT.");
                 } else {
                     Serial.println("Failed to publish sensor 2 data.");
@@ -203,6 +287,17 @@ void sensor_task(void *pvParameters) {
     }
 }
 
+void display() {
+
+}
+
+void read_modbus() {
+
+}
+
+void write_sd() {
+
+}
 
 void setup() {
     Serial.begin(115200);
