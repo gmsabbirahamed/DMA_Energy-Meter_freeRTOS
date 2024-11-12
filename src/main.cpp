@@ -1,445 +1,230 @@
-#include <Arduino.h>
 #include <WiFi.h>
-#include <WiFiManager.h>
+#include <WiFiManager.h>          // WiFiManager library
 #include <PubSubClient.h>
-#include <ModbusMaster.h>
-#include <NTPClient.h>
-#include <WiFiUdp.h>
-#include <SD.h>
-#include <SPI.h>
-#include <freertos/FreeRTOS.h>
-#include <freertos/task.h>
+#include <Preferences.h>
 
-#include "Config.h"
+#define MQTT_SERVER "test.mosquitto.org"
+#define MQTT_PORT 1883
+#define MAX_RETRIES 5
+#define BUTTON_PIN 23               // Change as per your setup
+#define SENSOR_PIN_1 39               // Change as per your setup
+#define SENSOR_PIN_2 36               // Change as per your setup
+#define LONG_PRESS_DURATION 3000   // 3 seconds
 
-#define MAX485_DE_RE 27 // DE and RE combined on GPIO 27 for control
-#define RS485_RX 16    // RO pin on RS-485 module to GPIO 16 (RX2)
-#define RS485_TX 17    // DI pin on RS-485 module to GPIO 17 (TX2)
+// Task intervals and delays
+#define WIFI_RETRY_DELAY 30000     // Wi-Fi retry delay (30 seconds)
+#define MQTT_RETRY_DELAY 10000     // MQTT retry delay (10 seconds)
+#define BACKOFF_MULTIPLIER 2       // Backoff multiplier for delay
 
-const int chipSelect = 5;// SD card CS pin
+// Define intervals for each sensor in milliseconds
+const unsigned long interval1 = 5000; // 5 seconds for sensor 1
+const unsigned long interval2 = 10000; // 10 seconds for sensor 2
 
-String status = "OK";
+// Variables to store the last time each sensor was read
+unsigned long lastReadTime1 = 0;
+unsigned long lastReadTime2 = 0;
 
-ModbusMaster node;
+// Wi-Fi and MQTT objects
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
+Preferences preferences;
+WiFiManager wifiManager;
 
-void preTransmission() {
-  digitalWrite(MAX485_DE_RE, HIGH); // Enable Transmit mode
-}
+bool debugMode = true;             // Set false to disable logging
+volatile bool apModeTriggered = false; // Flag to indicate AP mode needed
 
-void postTransmission() {
-  digitalWrite(MAX485_DE_RE, LOW); // Enable Receive mode
-}
+void connectToWiFi() {
+    // Attempt to connect to saved Wi-Fi credentials
+    WiFi.begin();  // Uses stored credentials
 
-// Time-related variables
-WiFiUDP ntpUDP;
-NTPClient timeClient(ntpUDP, "pool.ntp.org", 0, 3600000);  // Update time every hour
+    // Wait for connection (could add a timeout)
+    int retryCount = 0;
+    while (WiFi.status() != WL_CONNECTED && retryCount < 30) {  // 10 retries
+        vTaskDelay(500 / portTICK_PERIOD_MS);  // Wait and retry
+        retryCount++;
+        if (debugMode) Serial.print(".");
+    }
 
-WiFiClient espClient;   // MQTT client
-PubSubClient client(espClient);
-
-WiFiManager wifiManager;    // WiFiManager Object
-
-// Define constants for stack depth and task priority
-constexpr uint16_t TASK_STACK_DEPTH = 1000;
-constexpr UBaseType_t TASK_PRIORITY = 1;
-constexpr BaseType_t CORE_ID = 0; // Core to pin tasks to
-
-// Define stack arrays and task control block buffers for each task
-StaticTask_t modbusTaskBuffer;
-StaticTask_t wifi_mqtt_TaskBuffer;
-StaticTask_t outputTaskBuffer;
-StaticTask_t sdTaskBuffer;
-StaticTask_t buttonTaskBuffer;
-
-StackType_t modbusStack[TASK_STACK_DEPTH];
-StackType_t wifi_mqtt_Stack[TASK_STACK_DEPTH];
-StackType_t outputStack[TASK_STACK_DEPTH];
-StackType_t sdStack[TASK_STACK_DEPTH];
-StackType_t buttonStack[TASK_STACK_DEPTH];
-
-// modbus data variable
-int rs485_inquiry_taeHigh;
-int rs485_inquiry_taeLow;
-int rs485_inquiry_activePower;
-int rs485_inquiry_pAvolt;
-int rs485_inquiry_pBvolt;
-int rs485_inquiry_pCvolt;
-int rs485_inquiry_lABvolt;
-int rs485_inquiry_lBCvolt;
-int rs485_inquiry_lCAvolt;
-int rs485_inquiry_pAcurrent;
-int rs485_inquiry_pBcurrent;
-int rs485_inquiry_pCcurrent;
-int rs485_inquiry_frequency;
-int rs485_inquiry_powerfactor;
-
-float actual_taeHigh;
-float actual_taeLow;
-float actual_activePower;
-float actual_pAvolt;
-float actual_pBvolt;
-float actual_pCvolt;
-float actual_lABvolt;
-float actual_lBCvolt;
-float actual_lCAvolt;
-float actual_pAcurrent;
-float actual_pBcurrent;
-float actual_pCcurrent;
-float actual_frequency;
-float actual_powerfactor;
-
-
-
-// Forward declarations of task functions
-void modbusReadTask(void *parameter);
-void wifi_mqtt_Task(void *parameter);
-void sdTask(void *parameter);
-void buttonPressTask(void *parameter);
-
-void callback(char* topic, byte* payload, unsigned int length);
-int readModbusData(uint16_t reg_address);
-void connectToMQTT();
-String getFormattedTime();
-String getFormattedDate();
-void enableWiFiConfigurationMode();
-
-
-
-/******************************************************************************/
-/*----------------------------     setup     ---------------------------------*/
-/******************************************************************************/
-
-void setup() {
-    Serial.begin(115200);
-    Serial2.begin(9600, SERIAL_8N1, RS485_RX, RS485_TX); // UART2 for RS-485
-
-    pinMode(MAX485_DE_RE, OUTPUT);
-    digitalWrite(MAX485_DE_RE, LOW);      // Set to Receive mode initially
-
-    node.begin(1, Serial2);               // Modbus ID 1 and Serial2 for RS-485
-    node.preTransmission(preTransmission);
-    node.postTransmission(postTransmission);
-
-    Serial.println("RS-485 Modbus communication initialized.");
-
-    // Set MQTT server and callback
-    client.setServer(mqtt_broker, mqtt_port);
-    client.setCallback(callback);
-
-  // Initialize time client and attempt to get the time
-    timeClient.begin();
-    if (timeClient.forceUpdate()) {
-        Serial.println("Time synchronized with NTP server.");
+    if (WiFi.status() == WL_CONNECTED) {
+        if (debugMode) Serial.println("\nConnected to Wi-Fi.");
     } else {
-        Serial.println("Failed to sync time with NTP server. Using internal RTC if available.");
-    }
-
-    // Initialize SD card
-    if (!SD.begin(chipSelect)) {
-        Serial.println("SD card initialization failed!");
-        return;
-    }
-    Serial.println("SD card initialized.");
-
-    // Open or create file and add header if it doesn't exist
-    File file = SD.open("/em_data.csv", FILE_APPEND);
-    if (file.size() == 0) {
-        file.println("Date,Time,Status, taeHigh, taeLow, activePower, pAvolt, pBvolt, pCvolt, lABvolt, lBCvolt, lCAvolt, pAcurrent, pBcurrent, pCcurrent, frequency, powerfactor;"); // Header row
-    }
-    file.close();
-
-    // Create the Modbus read task pinned to core 0
-    xTaskCreateStaticPinnedToCore(
-        modbusReadTask,               // Task function
-        "Modbus_Read_Task",           // Task name
-        TASK_STACK_DEPTH,             // Stack depth
-        NULL,                         // Parameter (no data passed)
-        TASK_PRIORITY,                // Priority level
-        modbusStack,                  // Stack array
-        &modbusTaskBuffer,            // Task buffer
-        CORE_ID                       // Core to run the task on
-    );
-    
-    xTaskCreateStaticPinnedToCore(
-        wifi_mqtt_Task,               // Task function
-        "Modbus_Read_Task",           // Task name
-        TASK_STACK_DEPTH,             // Stack depth
-        NULL,                         // Parameter (no data passed)
-        TASK_PRIORITY,                // Priority level
-        modbusStack,                  // Stack array
-        &modbusTaskBuffer,            // Task buffer
-        CORE_ID                       // Core to run the task on
-    );
-
-    // Create the output control task pinned to core 0
-    xTaskCreateStaticPinnedToCore(
-        sdTask,            // Task function
-        "Output_Control_Task",        // Task name
-        TASK_STACK_DEPTH,             // Stack depth
-        NULL,                         // Parameter (no data passed)
-        TASK_PRIORITY,                // Priority level
-        outputStack,                  // Stack array
-        &outputTaskBuffer,            // Task buffer
-        CORE_ID                       // Core to run the task on
-    );
-    // Start button detection task
-    xTaskCreateStaticPinnedToCore(
-        buttonPressTask,          // Task function
-        "ButtonPressTask",        // Task name
-        TASK_STACK_DEPTH,         // Stack depth
-        NULL,                     // Parameter (no data passed)
-        TASK_PRIORITY,            // Priority level
-        buttonStack,              // Stack array
-        &buttonTaskBuffer,        // Task buffer
-        CORE_ID                   // Core to run the task on
-    );
-}
-
-void loop() {
-    // FreeRTOS handles task scheduling; loop() can be empty
-}
-
-
-
-
-
-// Modbus Read Task: Simulates reading data from a Modbus device
-void modbusReadTask(void *parameter) {
-    const TickType_t xDelay = pdMS_TO_TICKS(1000); // Delay time of 1 second
-
-    while (true) {
-        Serial.println("[Modbus Task] Reading data from Modbus...");
-
-        rs485_inquiry_taeHigh = readModbusData(0x30);
-        rs485_inquiry_taeLow = readModbusData(0x31);
-        rs485_inquiry_activePower = readModbusData(0x1A);
-        rs485_inquiry_pAvolt = readModbusData(0x14);
-        rs485_inquiry_pBvolt = readModbusData(0x15);
-        rs485_inquiry_pCvolt = readModbusData(0x16);
-        rs485_inquiry_lABvolt = readModbusData(0x17);
-        rs485_inquiry_lBCvolt = readModbusData(0x18);
-        rs485_inquiry_lCAvolt = readModbusData(0x19);
-        rs485_inquiry_pAcurrent = readModbusData(0x10);
-        rs485_inquiry_pBcurrent = readModbusData(0x11);
-        rs485_inquiry_pCcurrent = readModbusData(0x12);
-        rs485_inquiry_frequency = readModbusData(0x1E);
-        rs485_inquiry_powerfactor = readModbusData(0x1D);
-
-        actual_taeHigh = rs485_inquiry_taeHigh/10.0;
-        actual_taeLow = rs485_inquiry_taeLow/10.0;
-        actual_activePower = rs485_inquiry_activePower/10.0;  
-        actual_pAvolt = rs485_inquiry_pAvolt/10.0;
-        actual_pBvolt = rs485_inquiry_pBvolt/10.0;  
-        actual_pCvolt = rs485_inquiry_pCvolt/10.0;
-        actual_lABvolt = rs485_inquiry_lABvolt/10.0; 
-        actual_lBCvolt = rs485_inquiry_lBCvolt/10.0;
-        actual_lCAvolt = rs485_inquiry_lCAvolt/10.0;
-        actual_pAcurrent = rs485_inquiry_pAcurrent/10.0;
-        actual_pBcurrent = rs485_inquiry_pBcurrent/10.0;
-        actual_pCcurrent = rs485_inquiry_pCcurrent/10.0;
-        actual_frequency = rs485_inquiry_frequency/100.0;
-        actual_powerfactor = rs485_inquiry_powerfactor/1000.0;
-
-        vTaskDelay(xDelay); // Wait 1 second before repeating
-    }
-}
-// Function to read a specific Modbus register and print the result
-int readModbusData(uint16_t reg_address) {
-  uint8_t result;
-  uint16_t data;
-
-  result = node.readHoldingRegisters(reg_address, 1); // Read 1 register from 'reg'
-  if (result == node.ku8MBSuccess) {
-    data = node.getResponseBuffer(0); // Get the data from the first register
-    return data;
-  } else {
-    return result;
-  }
-}
-
-
-void wifi_mqtt_Task(void *parameter) {
-    WiFiManager wifiManager;
-    const TickType_t wifiAttemptDelay = pdMS_TO_TICKS(30000); // 30 seconds Wi-Fi attempt delay
-    const TickType_t restDelay = pdMS_TO_TICKS(90000);        // 1.5 minutes rest period
-    const TickType_t taskDelay = pdMS_TO_TICKS(1000);         // 1-second delay for normal operations
-    const TickType_t mqttRetryDelay = pdMS_TO_TICKS(5000);    // 5-second MQTT retry delay
-    const TickType_t shortDelay = pdMS_TO_TICKS(5000);    // 5-second MQTT retry delay
-
-    int wifiAttempts = 0;
-    int maxWifiAttempts = 5;
-
-    while (true) {
-        // Check WiFi connection
-        if (WiFi.status() != WL_CONNECTED) {
-            Serial.println("Wi-Fi not connected. Attempting to reconnect...");
-            WiFi.begin();
-            wifiAttempts++;
-
-            for (int attempt = 0; attempt < maxWifiAttempts && WiFi.status() != WL_CONNECTED; attempt++) {
-            RedLed(); vTaskDelay(shortDelay); Serial.print("."); BlackLed(); vTaskDelay(shortDelay);
-            }
-            if (WiFi.status() == WL_CONNECTED) {
-            BlackLed();
-            Serial.println("\nConnected to Wi-Fi");
-            Serial.print("IP Address: ");
-            Serial.println(WiFi.localIP());
-            return;
-            } else {
-            Serial.println("\nFailed to connect. Resting for 30 seconds...");
-            vTaskDelay(restDelay);
-            }
-            // Check if max attempts reached
-            if (wifiAttempts >= maxWifiAttempts) {
-                Serial.println("Max Wi-Fi attempts reached. Restarting ESP...");
-                ESP.restart(); // Restart ESP after max attempts
-            } else {
-                vTaskDelay(wifiAttemptDelay); // Wait before trying again
-            }
-        } else {
-            wifiAttempts = 0; // Reset WiFi attempts counter when connected
-
-            // Attempt MQTT connection if not connected
-            if (!client.connected()) {
-                connectToMQTT();
-                vTaskDelay(mqttRetryDelay); // Delay for MQTT retry if needed
-            }
-
-            // Publish data if connected to MQTT
-            if (client.connected()) {
-                Serial.println("[WiFi_MQTT_Task] Reading data from Modbus and publishing...");
-                client.loop();
-            }
-
-            vTaskDelay(taskDelay); // Regular delay between operations
-        }
+        if (debugMode) Serial.println("\nFailed to connect to Wi-Fi. Please press the button for AP mode.");
+        // Optionally: set a flag to enable AP mode in the `button_task` on long press
     }
 }
 
 void connectToMQTT() {
-    client.setServer(mqtt_broker, mqtt_port);
+    if (!mqttClient.connected()) {
+        if (debugMode) Serial.print("Connecting to MQTT...");
+        mqttClient.setServer(MQTT_SERVER, MQTT_PORT);
+        unsigned long startAttemptTime = millis();
 
-    Serial.print("Connecting to MQTT...");
-    if (client.connect("ESP32Client", mqtt_user, mqtt_pass)) {
-        Serial.println("Connected to MQTT broker.");
+        while (!mqttClient.connect("ESP32Client") && millis() - startAttemptTime < MQTT_RETRY_DELAY) {
+            vTaskDelay(200 / portTICK_PERIOD_MS); // Check connection status every 200ms
+        }
+    }
+
+    if (mqttClient.connected()) {
+        if (debugMode) Serial.println("Connected to MQTT.");
     } else {
-        Serial.print("Failed, rc=");
-        Serial.print(client.state());
-        Serial.println(". Will retry in 5 seconds.");
+        if (debugMode) Serial.println("MQTT connection failed.");
     }
 }
 
-void buttonPressTask(void *parameter) {
-    TickType_t buttonPressStart = 0;  // Start time of the button press
+void wifi_mqtt_task(void *pvParameters) {
+    int wifi_attempts = preferences.getInt("wifi_attempts", 0);
+    int mqtt_attempts = preferences.getInt("mqtt_attempts", 0);
+    bool wifi_connected = false;
+    bool mqtt_connected = false;
+    int backoffDelay = 15000;  // Base delay for backoff
 
     while (true) {
-        // Check if button is pressed (active low)
-        if (digitalRead(BUTTON_PIN) == LOW) {
-            if (buttonPressStart == 0) {
-                buttonPressStart = xTaskGetTickCount();  // Start timing
-            }
+        if (WiFi.status() != WL_CONNECTED) {
+            connectToWiFi();
+            wifi_connected = (WiFi.status() == WL_CONNECTED);
 
-            // Check if button has been held for the required time
-            if ((xTaskGetTickCount() - buttonPressStart) >= BUTTON_HOLD_TIME) {
-                Serial.println("Button held for 3 seconds. Enabling Wi-Fi configuration mode...");
-                enableWiFiConfigurationMode();
-                buttonPressStart = 0;  // Reset timing
+            if (wifi_connected) {
+                wifi_attempts = 0;
+                preferences.putInt("wifi_attempts", wifi_attempts); // Reset on success
+            } else {
+                wifi_attempts++;
+                if (debugMode) Serial.printf("Wi-Fi attempt %d failed.\n", wifi_attempts);
+                if (wifi_attempts >= MAX_RETRIES) ESP.restart();
+
+                backoffDelay *= BACKOFF_MULTIPLIER;
+                vTaskDelay(backoffDelay / portTICK_PERIOD_MS);
+                continue;
             }
-        } else {
-            // Reset if button is released before reaching the hold time
-            buttonPressStart = 0;
         }
 
-        vTaskDelay(pdMS_TO_TICKS(100));  // Check button state every 100 ms
+        if (wifi_connected && !mqttClient.connected()) {
+            connectToMQTT();
+            mqtt_connected = mqttClient.connected();
+
+            if (mqtt_connected) {
+                mqtt_attempts = 0;
+                preferences.putInt("mqtt_attempts", mqtt_attempts); // Reset on success
+            } else {
+                mqtt_attempts++;
+                if (debugMode) Serial.printf("MQTT attempt %d failed.\n", mqtt_attempts);
+                if (mqtt_attempts >= MAX_RETRIES) ESP.restart();
+
+                backoffDelay *= BACKOFF_MULTIPLIER;
+                vTaskDelay(backoffDelay / portTICK_PERIOD_MS);
+                continue;
+            }
+        }
+
+        if (mqtt_connected) mqttClient.loop();
+        vTaskDelay(1000 / portTICK_PERIOD_MS);
     }
 }
-void enableWiFiConfigurationMode() {
-    // Open WiFiManager configuration portal
-    wifiManager.startConfigPortal("ESP32_Config_Portal");
 
-    // Once Wi-Fi is connected, WiFiManager will store credentials
-    if (WiFi.status() == WL_CONNECTED) {
-        Serial.println("Wi-Fi connected successfully through configuration portal.");
-    } else {
-        Serial.println("Failed to connect through configuration portal.");
-    }
-}
-
-// Output Control Task: Simulates control of an output device
-void sdTask(void *parameter) {
-    const TickType_t xDelay = pdMS_TO_TICKS(2000); // Delay time of 2 seconds
+void button_task(void *pvParameters) {
+    pinMode(BUTTON_PIN, INPUT_PULLUP);
+    unsigned long pressStartTime = 0;
+    bool longPressDetected = false;
 
     while (true) {
-        
-        
-        // Retrieve current date and time
-        String date = getFormattedDate();
-        String time = getFormattedTime();
+        if (digitalRead(BUTTON_PIN) == LOW) {  // Button is pressed
+            if (pressStartTime == 0) pressStartTime = millis();
 
-        // Open file in append mode
-        File file = SD.open("/em_data.csv", FILE_APPEND);
-        if (file) {
-            // Write data row to file
-            file.print(date); file.print(",");
-            file.print(time); file.print(",");
-            file.print(status); file.print(",");
-            
-            // Write each variable separated by commas
-            file.print(actual_taeHigh); file.print(",");
-            file.print(actual_taeLow); file.print(",");
-            file.print(actual_activePower); file.print(",");
-            file.print(actual_pAvolt); file.print(",");
-            file.print(actual_pBvolt); file.print(",");
-            file.print(actual_pCvolt); file.print(",");
-            file.print(actual_lABvolt); file.print(",");
-            file.print(actual_lBCvolt); file.print(",");
-            file.print(actual_lCAvolt); file.print(",");
-            file.print(actual_pAcurrent); file.print(",");
-            file.print(actual_pBcurrent); file.print(",");
-            file.print(actual_pCcurrent); file.print(",");
-            file.print(actual_frequency); file.print(",");
-            file.print(actual_powerfactor); file.print(",");
-            // file.println(n);  // End of line
-
-            file.close();  // Close the file
-            Serial.println("Data written to SD card.");
-        } else {
-            Serial.println("Error opening em_data.csv.");
+            if (millis() - pressStartTime >= LONG_PRESS_DURATION && !longPressDetected) {
+                longPressDetected = true;
+                apModeTriggered = true;  // Trigger AP mode
+                if (debugMode) Serial.println("Long press detected. Triggering AP mode for Wi-Fi configuration.");
+            }
+        } else {  // Button is released
+            pressStartTime = 0;
+            longPressDetected = false;
         }
-        vTaskDelay(xDelay); // Wait 2 seconds before repeating
+
+        // If AP mode is triggered, break out of the loop and start AP
+        if (apModeTriggered) {
+            if (debugMode) Serial.println("Starting Wi-Fi AP mode...");
+            wifiManager.resetSettings();  // Reset saved credentials
+            wifiManager.startConfigPortal("DMA ENERGY METER");
+            // wifiManager.autoConnect("ESP32_AP");  // Start AP with default SSID
+            apModeTriggered = false;  // Reset flag after configuration
+            ESP.restart();  // Restart to apply new settings
+        }
+
+        vTaskDelay(100 / portTICK_PERIOD_MS); // Check button status every 100 ms
     }
 }
-// Function to get the current date in "YYYY-MM-DD" format
-String getFormattedDate() {
-  if (!timeClient.isTimeSet()) return "1970-01-01";  // Default date if time not set
-  time_t rawTime = timeClient.getEpochTime();
-  struct tm * timeInfo = localtime(&rawTime);
-  char buffer[11];
-  strftime(buffer, sizeof(buffer), "%Y-%m-%d", timeInfo);
-  return String(buffer);
-}
 
-// Function to get the current time in "HH:MM:SS" format
-String getFormattedTime() {
-  if (!timeClient.isTimeSet()) return "00:00:00";  // Default time if time not set
-  time_t rawTime = timeClient.getEpochTime();
-  struct tm * timeInfo = localtime(&rawTime);
-  char buffer[9];
-  strftime(buffer, sizeof(buffer), "%H:%M:%S", timeInfo);
-  return String(buffer);
-}
 
-/**************************************************************/
+/**************************************     ..........      ********************************************/
+/*                                          : sensor :                                                 */
+/**************************************     :........:       *******************************************/
 
-// MQTT callback for received messages
-void callback(char* topic, byte* payload, unsigned int length) {
-    String message;
-    Serial.print("Message arrived [");
-    Serial.print(topic);
-    Serial.print("] ");
-    for (unsigned int i = 0; i < length; i++) {
-        message += (char)payload[i];
+// Sensor reading and publishing task
+void sensor_task(void *pvParameters) {
+    while (true) {
+        unsigned long currentMillis = millis(); // Get current time
+
+        // Check if it's time to read sensor 1
+        if (currentMillis - lastReadTime1 >= interval1) {
+            lastReadTime1 = currentMillis;
+            int sensorValue1 = analogRead(SENSOR_PIN_1);
+            Serial.printf("Sensor 1 Value: %d\n", sensorValue1);
+
+            if (WiFi.isConnected() && mqttClient.connected()) {
+                String payload = String(sensorValue1);
+                if (mqttClient.publish("sensor1/data", payload.c_str())) {
+                    Serial.println("Sensor 1 data published to MQTT.");
+                } else {
+                    Serial.println("Failed to publish sensor 1 data.");
+                }
+            } else {
+                Serial.println("WiFi or MQTT not connected. Skipping MQTT publish for sensor 1.");
+            }
+        }
+
+        // Check if it's time to read sensor 2
+        if (currentMillis - lastReadTime2 >= interval2) {
+            lastReadTime2 = currentMillis;
+            int sensorValue2 = analogRead(SENSOR_PIN_2);
+            Serial.printf("Sensor 2 Value: %d\n", sensorValue2);
+
+            if (WiFi.isConnected() && mqttClient.connected()) {
+                String payload = String(sensorValue2);
+                if (mqttClient.publish("sensor2/data", payload.c_str())) {
+                    Serial.println("Sensor 2 data published to MQTT.");
+                } else {
+                    Serial.println("Failed to publish sensor 2 data.");
+                }
+            } else {
+                Serial.println("WiFi or MQTT not connected. Skipping MQTT publish for sensor 2.");
+            }
+        }
+
+        vTaskDelay(10 / portTICK_PERIOD_MS); // Short delay to allow FreeRTOS scheduler to run other tasks
     }
-    Serial.print(message);
-    Serial.println();
 }
+
+
+void setup() {
+    Serial.begin(115200);
+    WiFi.mode(WIFI_STA);
+    mqttClient.setServer(MQTT_SERVER, MQTT_PORT);
+    preferences.begin("connection", false);
+
+    // Start the WiFi and MQTT management task
+    xTaskCreatePinnedToCore(
+        wifi_mqtt_task, "wifi_mqtt_task", 4096, NULL, 1, NULL, 0
+    );
+
+    // Start the button management task
+    xTaskCreatePinnedToCore(
+        button_task, "button_task", 2048, NULL, 1, NULL, 1
+    );
+
+    // Start the sensor management task
+    xTaskCreatePinnedToCore(
+        sensor_task, "sensor_task", 2048, NULL, 1, NULL, 1
+    );
+
+}
+
+void loop() {}
